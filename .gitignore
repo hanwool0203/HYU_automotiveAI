@@ -1,0 +1,45 @@
+# ROS2 build outputs
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# ROS bag files
+*.bag
+*.db3
+*.mcap
+rosbag/
+rosbags/
+
+# Model / TensorRT / large weights
+*.onnx
+*.onnx.data
+*.engine
+*.trt
+*.pth
+*.pt
+*.ckpt
+*.weights
+
+# Dataset / images / videos
+dataset/
+datasets/
+images/
+frames/
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+
+# System
+.DS_Store
