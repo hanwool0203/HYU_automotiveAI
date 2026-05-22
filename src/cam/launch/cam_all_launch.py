@@ -19,12 +19,12 @@ def generate_launch_description():
             output='screen',
         ),
 
-        Node(
-            package='cam',
-            executable='stereo_depth_node',
-            name='stereo_depth_node',
-            output='screen',
-        ),
+        # Node(
+        #     package='cam',
+        #     executable='stereo_depth_node',
+        #     name='stereo_depth_node',
+        #     output='screen',
+        # ),
 
         Node(
             package='cam',

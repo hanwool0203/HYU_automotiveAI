@@ -24,8 +24,7 @@ class SignDecisionNode(Node):
         # Topics
         # ============================================================
         self.declare_parameter("yolo_detections_topic", "/yolo/left_detections")
-        self.declare_parameter("depth_topic", "/stereo/depth/image_raw")
-        self.declare_parameter("image_topic", "/stereo/left_rect")
+        self.declare_parameter("image_topic", "/left/image_raw")
         self.declare_parameter("drive_mode_topic", "/drive_mode")
 
         # ============================================================
@@ -38,19 +37,21 @@ class SignDecisionNode(Node):
         self.declare_parameter("stop_label", "stop_sign")
         self.declare_parameter("slow_label", "slow_sign")
         self.declare_parameter("traffic_light_label", "traffic_light")
+        self.declare_parameter("rover_label", "other_rover")
 
-        self.declare_parameter("stop_conf_threshold", 0.70)
-        self.declare_parameter("slow_conf_threshold", 0.70)
-        self.declare_parameter("traffic_conf_threshold", 0.50)
+        self.declare_parameter("stop_conf_threshold", 0.50)
+        self.declare_parameter("slow_conf_threshold", 0.80)
+        self.declare_parameter("traffic_conf_threshold", 0.30)
+        self.declare_parameter("rover_conf_threshold", 0.50)
 
         # traffic_light unknown stop은 N프레임 연속 가까울 때만 적용
-        self.declare_parameter("traffic_near_confirm_frames", 3)
+        self.declare_parameter("traffic_near_confirm_frames", 1)
+        self.declare_parameter("traffic_min_bbox_area", 4500.0)
 
-        # bbox 안 가까운 쪽 5% depth가 이 값 이하일 때만 트리거
-        self.declare_parameter("depth_trigger_m", 0.6)
+        self.declare_parameter("rover_stop_min_bbox_area", 15000.0)
+        self.declare_parameter("rover_stop_duration_sec", 2.0)
 
-        # 최신 depth/image가 너무 오래됐으면 무시
-        self.declare_parameter("depth_timeout_sec", 0.3)
+        # 최신 image가 너무 오래됐으면 무시
         self.declare_parameter("image_timeout_sec", 0.3)
 
         # 너무 작은 박스 무시
@@ -62,14 +63,13 @@ class SignDecisionNode(Node):
         # stop_sign, slow_sign은 한 번만 처리
         self.declare_parameter("one_shot_stop", True)
         self.declare_parameter("one_shot_slow", True)
+        self.declare_parameter("one_shot_traffic_light", True)
+        self.declare_parameter("one_shot_rover", False)
 
         # 신호등 색 판단 기준
-        self.declare_parameter("red_ratio_threshold", 0.015)
-        self.declare_parameter("green_ratio_threshold", 0.001)
-        self.declare_parameter("color_dominance_ratio", 1.2)
+        self.declare_parameter("green_ratio_threshold", 0.020)
 
         self.yolo_detections_topic = self.get_parameter("yolo_detections_topic").value
-        self.depth_topic = self.get_parameter("depth_topic").value
         self.image_topic = self.get_parameter("image_topic").value
         self.drive_mode_topic = self.get_parameter("drive_mode_topic").value
 
@@ -82,6 +82,7 @@ class SignDecisionNode(Node):
         self.stop_label = self.get_parameter("stop_label").value.lower()
         self.slow_label = self.get_parameter("slow_label").value.lower()
         self.traffic_light_label = self.get_parameter("traffic_light_label").value.lower()
+        self.rover_label = self.get_parameter("rover_label").value.lower()
 
         self.stop_conf_threshold = float(
             self.get_parameter("stop_conf_threshold").value
@@ -92,12 +93,22 @@ class SignDecisionNode(Node):
         self.traffic_conf_threshold = float(
             self.get_parameter("traffic_conf_threshold").value
         )
+        self.rover_conf_threshold = float(
+            self.get_parameter("rover_conf_threshold").value
+        )
+        self.rover_stop_min_bbox_area = float(
+            self.get_parameter("rover_stop_min_bbox_area").value
+        )
 
-        self.depth_trigger_m = float(self.get_parameter("depth_trigger_m").value)
+        self.rover_stop_duration_sec = float(
+            self.get_parameter("rover_stop_duration_sec").value
+        )
         self.traffic_near_confirm_frames = int(
             self.get_parameter("traffic_near_confirm_frames").value
         )
-        self.depth_timeout_sec = float(self.get_parameter("depth_timeout_sec").value)
+        self.traffic_min_bbox_area = float(
+            self.get_parameter("traffic_min_bbox_area").value
+        )
         self.image_timeout_sec = float(self.get_parameter("image_timeout_sec").value)
 
         self.min_bbox_area = float(self.get_parameter("min_bbox_area").value)
@@ -107,24 +118,18 @@ class SignDecisionNode(Node):
 
         self.one_shot_stop = bool(self.get_parameter("one_shot_stop").value)
         self.one_shot_slow = bool(self.get_parameter("one_shot_slow").value)
-
-        self.red_ratio_threshold = float(
-            self.get_parameter("red_ratio_threshold").value
+        self.one_shot_rover = bool(self.get_parameter("one_shot_rover").value)
+        self.one_shot_traffic_light = bool(
+            self.get_parameter("one_shot_traffic_light").value
         )
         self.green_ratio_threshold = float(
             self.get_parameter("green_ratio_threshold").value
-        )
-        self.color_dominance_ratio = float(
-            self.get_parameter("color_dominance_ratio").value
         )
 
         # ============================================================
         # State
         # ============================================================
         self.bridge = CvBridge()
-
-        self.latest_depth = None
-        self.latest_depth_time = 0.0
 
         self.latest_image = None
         self.latest_image_time = 0.0
@@ -140,12 +145,16 @@ class SignDecisionNode(Node):
 
         self.handled_stop_sign = False
         self.handled_slow_sign = False
+        self.handled_traffic_light = False
+        self.handled_rover = False
+        self.last_rover_decision_time = 0.0
+        self.rover_stop_until = 0.0
 
         # traffic_light는 one-shot 아님
         # 빨간불이면 계속 정지 상태 유지, 초록불이면 해제
         self.traffic_light_stop_active = False
 
-        # unknown traffic_light가 가까운 depth로 몇 프레임 연속 잡혔는지
+        # unknown traffic_light가 몇 프레임 연속 잡혔는지
         self.traffic_near_confirm_count = 0
 
         # ============================================================
@@ -168,13 +177,6 @@ class SignDecisionNode(Node):
             10,
         )
 
-        self.depth_sub = self.create_subscription(
-            Image,
-            self.depth_topic,
-            self.depth_callback,
-            sensor_qos,
-        )
-
         self.image_sub = self.create_subscription(
             Image,
             self.image_topic,
@@ -194,21 +196,9 @@ class SignDecisionNode(Node):
 
         self.get_logger().info("Sign Decision Node Started")
         self.get_logger().info(f"YOLO detections topic: {self.yolo_detections_topic}")
-        self.get_logger().info(f"Depth topic          : {self.depth_topic}")
         self.get_logger().info(f"Image topic          : {self.image_topic}")
         self.get_logger().info(f"Drive mode topic     : {self.drive_mode_topic}")
-        self.get_logger().info(f"depth_trigger_m      : {self.depth_trigger_m:.2f} m")
         self.get_logger().info(f"Traffic light rule: GREEN confirmed -> release, otherwise near traffic_light -> stop")
-
-    def depth_callback(self, msg):
-        try:
-            depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
-        except Exception as e:
-            self.get_logger().warn(f"Depth cv_bridge failed: {e}")
-            return
-
-        self.latest_depth = depth
-        self.latest_depth_time = time.time()
 
     def image_callback(self, msg):
         try:
@@ -243,29 +233,6 @@ class SignDecisionNode(Node):
             return None
 
         return arr[y1:y2, x1:x2]
-
-    def get_near_depth_5_percent_in_bbox(self, bbox):
-        if self.latest_depth is None:
-            return None
-
-        now = time.time()
-        if now - self.latest_depth_time > self.depth_timeout_sec:
-            return None
-
-        roi = self.crop_bbox(self.latest_depth, bbox)
-
-        if roi is None:
-            return None
-
-        valid = roi[np.isfinite(roi)]
-        valid = valid[valid > 0.0]
-
-        if valid.size == 0:
-            return None
-
-        # 핵심: 최소값 대신 가까운 쪽 5% 지점 사용
-        near_depth = float(np.percentile(valid, 5))
-        return near_depth
 
     def classify_traffic_light_color(self, bbox):
         if self.latest_image is None:
@@ -317,6 +284,7 @@ class SignDecisionNode(Node):
         best_stop = None
         best_slow = None
         best_traffic = None
+        best_rover = None
 
         for det in detections:
             class_name = str(det.get("class_name", "")).lower()
@@ -336,6 +304,7 @@ class SignDecisionNode(Node):
                 self.stop_label,
                 self.slow_label,
                 self.traffic_light_label,
+                self.rover_label,
             ]:
                 continue
             # ============================================================
@@ -344,50 +313,35 @@ class SignDecisionNode(Node):
             # green이 아니면 unknown으로 보고, 가까울 때만 stop 후보로 사용
             # ============================================================
             if class_name == self.traffic_light_label:
+                if self.one_shot_traffic_light and self.handled_traffic_light:
+                    continue
                 if confidence < self.traffic_conf_threshold:
+                    continue
+                if area < self.traffic_min_bbox_area:
+                    self.get_logger().info(
+                        f"traffic_light ignored: area={area:.1f} < {self.traffic_min_bbox_area:.1f}"
+                    )
                     continue
 
                 color, red_ratio, green_ratio = self.classify_traffic_light_color(bbox)
 
-                # green은 depth 없이 후보로 인정
+                # green이 아니면 unknown으로 보고 stop 후보로 사용
                 # 실제 출발은 아래 traffic 처리부에서 green_confirm_frames로 결정
                 if color == "green":
                     if best_traffic is None or confidence > best_traffic["confidence"]:
                         best_traffic = {
                             "confidence": confidence,
                             "area": area,
-                            "near_depth": None,
                             "color": "green",
                             "red_ratio": red_ratio,
                             "green_ratio": green_ratio,
                         }
                     continue
 
-                # green이 아니면 unknown 취급
-                # 단, stop을 걸 때는 기존처럼 depth <= depth_trigger_m 일 때만 인정
-                near_depth = self.get_near_depth_5_percent_in_bbox(bbox)
-
-                if near_depth is None:
-                    self.get_logger().info(
-                        "traffic_light detected but no valid depth in bbox. ignored."
-                    )
-                    continue
-
-                if near_depth > self.depth_trigger_m:
-                    self.traffic_near_confirm_count = 0
-
-                    self.get_logger().info(
-                        f"traffic_light detected but too far: "
-                        f"near_depth_5%={near_depth:.3f} m > {self.depth_trigger_m:.3f} m | "
-                        f"near_count reset"
-                    )
-                    continue
-
                 if best_traffic is None or confidence > best_traffic["confidence"]:
                     best_traffic = {
                         "confidence": confidence,
                         "area": area,
-                        "near_depth": near_depth,
                         "color": "unknown",
                         "red_ratio": red_ratio,
                         "green_ratio": green_ratio,
@@ -395,19 +349,28 @@ class SignDecisionNode(Node):
 
                 continue
 
-            near_depth = self.get_near_depth_5_percent_in_bbox(bbox)
+            # ============================================================
+            # other_rover:
+            # depth 없이 bbox area 기준으로 가까움 판단
+            # ============================================================
+            if class_name == self.rover_label:
+                if confidence < self.rover_conf_threshold:
+                    continue
 
-            if near_depth is None:
-                self.get_logger().info(
-                    f"{class_name} detected but no valid depth in bbox. ignored."
-                )
-                continue
+                if area < self.rover_stop_min_bbox_area:
+                    self.get_logger().info(
+                        f"other_rover ignored: "
+                        f"conf={confidence:.3f}, "
+                        f"area={area:.1f} < {self.rover_stop_min_bbox_area:.1f}"
+                    )
+                    continue
 
-            if near_depth > self.depth_trigger_m:
-                self.get_logger().info(
-                    f"{class_name} detected but too far: "
-                    f"near_depth_5%={near_depth:.3f} m > {self.depth_trigger_m:.3f} m"
-                )
+                if best_rover is None or confidence > best_rover["confidence"]:
+                    best_rover = {
+                        "confidence": confidence,
+                        "area": area,
+                    }
+
                 continue
 
             if class_name == self.stop_label and confidence >= self.stop_conf_threshold:
@@ -415,7 +378,6 @@ class SignDecisionNode(Node):
                     best_stop = {
                         "confidence": confidence,
                         "area": area,
-                        "near_depth": near_depth,
                     }
 
             elif class_name == self.slow_label and confidence >= self.slow_conf_threshold:
@@ -423,7 +385,6 @@ class SignDecisionNode(Node):
                     best_slow = {
                         "confidence": confidence,
                         "area": area,
-                        "near_depth": near_depth,
                     }
 
         # ============================================================
@@ -435,26 +396,25 @@ class SignDecisionNode(Node):
 
         if best_traffic is not None:
             color = best_traffic["color"]
-            near_depth = best_traffic["near_depth"]
-
-            near_depth_str = "None" if near_depth is None else f"{near_depth:.3f}"
 
             self.get_logger().info(
                 f"TRAFFIC_LIGHT | color={color}, "
                 f"conf={best_traffic['confidence']:.3f}, "
-                f"near_depth_5%={near_depth_str} m, "
+                f"area={best_traffic['area']:.1f}, "
                 f"green_ratio={best_traffic['green_ratio']:.3f}, "
             )
 
             # ============================================================
             # GREEN:
-            # depth 없이 판단하고 traffic light stop latch만 해제
+            # traffic light stop latch만 해제
             # 여기서 return하지 않음.
             # 그래야 같은 프레임의 stop_sign / slow_sign도 아래에서 처리됨.
             # ============================================================
             if color == "green":
                 self.traffic_near_confirm_count = 0
                 self.traffic_light_stop_active = False
+                if self.one_shot_traffic_light:
+                    self.handled_traffic_light = True
                 self.get_logger().info("GREEN traffic light -> traffic stop released")
 
             else: #unknown
@@ -465,7 +425,6 @@ class SignDecisionNode(Node):
                         f"UNKNOWN traffic_light near buffering "
                         f"{self.traffic_near_confirm_count}/"
                         f"{self.traffic_near_confirm_frames} | "
-                        f"near_depth_5%={near_depth_str} m"
                     )
                     return
 
@@ -481,7 +440,33 @@ class SignDecisionNode(Node):
                     return
 
         # ============================================================
-        # 2. Stop sign 처리
+        # 2. Other rover 처리
+        #    bbox area가 충분히 크면 정지
+        # ============================================================
+
+        if best_rover is not None:
+            if self.one_shot_rover and self.handled_rover:
+                return
+
+            if now - self.last_rover_decision_time >= self.decision_cooldown_sec:
+                self.handled_rover = True
+                self.last_rover_decision_time = now
+                self.rover_stop_until = now + self.rover_stop_duration_sec
+
+                self.publish_drive_mode("stop")
+
+                self.get_logger().warn(
+                    f"OTHER ROVER STOP triggered | "
+                    f"conf={best_rover['confidence']:.3f}, "
+                    f"area={best_rover['area']:.1f} >= "
+                    f"{self.rover_stop_min_bbox_area:.1f} | "
+                    f"stop for {self.rover_stop_duration_sec:.1f}s"
+                )
+
+            return
+
+        # ============================================================
+        # 3. Stop sign 처리
         #    stop_sign은 one-shot
         #    단, traffic_light_stop_active와 독립적이어야 함
         # ============================================================
@@ -502,14 +487,13 @@ class SignDecisionNode(Node):
                 self.get_logger().warn(
                     f"STOP SIGN triggered | "
                     f"conf={best_stop['confidence']:.3f}, "
-                    f"near_depth_5%={best_stop['near_depth']:.3f} m, "
                     f"area={best_stop['area']:.1f} | "
                     f"stop for {self.stop_duration_sec:.1f}s"
                 )
             return
 
         # ============================================================
-        # 3. Slow sign 처리
+        # 4. Slow sign 처리
         # ============================================================
 
         if best_slow is not None:
@@ -527,7 +511,6 @@ class SignDecisionNode(Node):
                 self.get_logger().info(
                     f"SLOW SIGN triggered | "
                     f"conf={best_slow['confidence']:.3f}, "
-                    f"near_depth_5%={best_slow['near_depth']:.3f} m, "
                     f"area={best_slow['area']:.1f} | "
                     f"slow for {self.slow_duration_sec:.1f}s"
                 )
@@ -537,6 +520,12 @@ class SignDecisionNode(Node):
 
         # traffic light stop latch이 최우선
         if self.traffic_light_stop_active:
+            if self.current_drive_mode != "stop":
+                self.publish_drive_mode("stop")
+            return
+        
+        # other_rover bbox 기반 정지
+        if now < self.rover_stop_until:
             if self.current_drive_mode != "stop":
                 self.publish_drive_mode("stop")
             return

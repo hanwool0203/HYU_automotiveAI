@@ -26,7 +26,6 @@ setup(
         'console_scripts': [
             "sign_decision_node = decision.sign_decision:main",
             "roundabout_decision_node = decision.roundabout_decision:main",
-            "ttc_safety_node = decision.ttc_safety:main",
         ],
     },
 )

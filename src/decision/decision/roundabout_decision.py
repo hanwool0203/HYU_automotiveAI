@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import json
+from statistics import mode
 import time
 
 import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
@@ -22,6 +23,9 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("target_left_topic", "/centerline/target_left")
         self.declare_parameter("target_right_topic", "/centerline/target_right")
         self.declare_parameter("route_select_topic", "/route_select")
+        self.declare_parameter("ttc_enable_topic", "/ttc/enable")
+        self.declare_parameter("ttc_enable_entry_count", 2)
+        self.declare_parameter("drive_mode_topic", "/drive_mode")
 
         # ============================================================
         # YOLO labels
@@ -37,19 +41,24 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("roundabout_route", "left")   # 반시계방향 회전
         self.declare_parameter("exit_route", "right")        # 출구 탈출
         self.declare_parameter("default_route", "right")
+        self.declare_parameter("final_route", "center")
 
         # 좌회전이면 3번째 출구, 우회전이면 1번째 출구
-        self.declare_parameter("left_arrow_exit_index", 3)
-        self.declare_parameter("right_arrow_exit_index", 1)
+        self.declare_parameter("left_arrow_first_exit_index", 3)
+        self.declare_parameter("left_arrow_second_exit_index", 1)
+
+        self.declare_parameter("right_arrow_first_exit_index", 1)
+        self.declare_parameter("right_arrow_second_exit_index", 3)
 
         # 진입 직후 right를 유지할 시간
         self.declare_parameter("entry_hold_sec", 3.0)
 
         # 출구 탈출 시 right 유지 시간
-        self.declare_parameter("exit_hold_sec", 8.0)
+        self.declare_parameter("exit_hold_sec", 5.0)
 
         # 회전교차로 탈출 후 유지할 route
-        self.declare_parameter("after_exit_route", "left")
+        self.declare_parameter("after_exit_left_route", "left")
+        self.declare_parameter("after_exit_right_route", "right")
 
         # ============================================================
         # Exit detection by target x gap
@@ -57,7 +66,7 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("exit_gap_px", 180.0)
         self.declare_parameter("exit_gap_reset_px", 120.0)
         self.declare_parameter("exit_confirm_frames", 3)
-        self.declare_parameter("exit_min_interval_sec", 1.0)
+        self.declare_parameter("exit_min_interval_sec", 2.0)
         self.declare_parameter("target_timeout_sec", 0.3)
 
         # gap 노이즈 제한
@@ -68,7 +77,9 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("intersection_trigger_delay_sec", 1.0)
         self.declare_parameter("intersection_trigger_gap_px", 80.0)
         self.declare_parameter("intersection_trigger_confirm_frames", 3)
-        self.declare_parameter("intersection_fix_route", "left")
+
+        self.declare_parameter("intersection_fix_left_route", "left")
+        self.declare_parameter("intersection_fix_right_route", "right")
         self.declare_parameter("intersection_fix_hold_sec", 5.0)
         self.declare_parameter("after_intersection_route", "right")
 
@@ -81,6 +92,12 @@ class RoundaboutDecisionNode(Node):
         self.left_topic = self.get_parameter("target_left_topic").value
         self.right_topic = self.get_parameter("target_right_topic").value
         self.route_topic = self.get_parameter("route_select_topic").value
+        self.drive_mode_topic = self.get_parameter("drive_mode_topic").value
+
+        self.ttc_enable_topic = self.get_parameter("ttc_enable_topic").value
+        self.ttc_enable_entry_count = int(
+            self.get_parameter("ttc_enable_entry_count").value
+        )
 
         self.left_arrow_label = self.get_parameter("left_arrow_label").value.lower()
         self.right_arrow_label = self.get_parameter("right_arrow_label").value.lower()
@@ -92,12 +109,19 @@ class RoundaboutDecisionNode(Node):
         self.roundabout_route = self.get_parameter("roundabout_route").value.lower()
         self.exit_route = self.get_parameter("exit_route").value.lower()
         self.default_route = self.get_parameter("default_route").value.lower()
-
-        self.left_arrow_exit_index = int(
-            self.get_parameter("left_arrow_exit_index").value
+        self.final_route = self.get_parameter("final_route").value.lower()
+        self.left_arrow_first_exit_index = int(
+            self.get_parameter("left_arrow_first_exit_index").value
         )
-        self.right_arrow_exit_index = int(
-            self.get_parameter("right_arrow_exit_index").value
+        self.left_arrow_second_exit_index = int(
+            self.get_parameter("left_arrow_second_exit_index").value
+        )
+
+        self.right_arrow_first_exit_index = int(
+            self.get_parameter("right_arrow_first_exit_index").value
+        )
+        self.right_arrow_second_exit_index = int(
+            self.get_parameter("right_arrow_second_exit_index").value
         )
 
         self.entry_hold_sec = float(self.get_parameter("entry_hold_sec").value)
@@ -112,7 +136,8 @@ class RoundaboutDecisionNode(Node):
         self.target_timeout_sec = float(
             self.get_parameter("target_timeout_sec").value
         )
-        self.after_exit_route = self.get_parameter("after_exit_route").value.lower()
+        self.after_exit_left_route = self.get_parameter("after_exit_left_route").value.lower()
+        self.after_exit_right_route = self.get_parameter("after_exit_right_route").value.lower()
 
         self.enable_intersection_fix_after_exit = bool(
             self.get_parameter("enable_intersection_fix_after_exit").value
@@ -126,13 +151,12 @@ class RoundaboutDecisionNode(Node):
         self.intersection_trigger_confirm_frames = int(
             self.get_parameter("intersection_trigger_confirm_frames").value
         )
-        self.intersection_fix_route = self.get_parameter("intersection_fix_route").value.lower()
+        self.intersection_fix_left_route = self.get_parameter("intersection_fix_left_route").value.lower()
+        self.intersection_fix_right_route = self.get_parameter("intersection_fix_right_route").value.lower()
         self.intersection_fix_hold_sec = float(
             self.get_parameter("intersection_fix_hold_sec").value
         )
-        self.after_intersection_route = self.get_parameter(
-            "after_intersection_route"
-        ).value.lower()
+        self.after_intersection_route = self.get_parameter("after_intersection_route").value.lower()
 
         self.roundabout_entry_gap_px = float(
             self.get_parameter("roundabout_entry_gap_px").value
@@ -156,8 +180,10 @@ class RoundaboutDecisionNode(Node):
         # IN_ROUNDABOUT
         # EXITING
         # AFTER_EXIT_LEFT
+        # AFTER_EXIT_RIGHT
         # INTERSECTION_LEFT_FIX
         # AFTER_INTERSECTION_RIGHT
+        # FINAL_CENTER
 
         self.desired_exit_index = None
         self.exit_count = 0
@@ -196,6 +222,10 @@ class RoundaboutDecisionNode(Node):
 
         self.last_valid_gap = None
 
+        self.first_exit_index = None
+        self.second_exit_index = None
+        self.arrow_plan = None
+
         # ============================================================
         # ROS pubs/subs
         # ============================================================
@@ -226,9 +256,21 @@ class RoundaboutDecisionNode(Node):
             10,
         )
 
+        self.ttc_enable_pub = self.create_publisher(
+            Bool,
+            self.ttc_enable_topic,
+            10,
+        )
+        self.drive_mode_pub = self.create_publisher(
+            String,
+            self.drive_mode_topic,
+            10,
+        )
+
         self.timer = self.create_timer(0.05, self.timer_callback)
 
         self.publish_route(self.default_route)
+        self.publish_ttc_enable(False)
 
         self.get_logger().info("Roundabout Decision Node Started")
         self.get_logger().info(f"Sub YOLO        : {self.yolo_topic}")
@@ -241,8 +283,14 @@ class RoundaboutDecisionNode(Node):
             f"exit_route={self.exit_route}"
         )
         self.get_logger().info(
-            f"left_arrow -> {self.left_arrow_exit_index}rd exit, "
-            f"right_arrow -> {self.right_arrow_exit_index}st exit"
+            f"left_arrow plan: "
+            f"first={self.left_arrow_first_exit_index}, "
+            f"second={self.left_arrow_second_exit_index}"
+        )
+        self.get_logger().info(
+            f"right_arrow plan: "
+            f"first={self.right_arrow_first_exit_index}, "
+            f"second={self.right_arrow_second_exit_index}"
         )
 
     # ============================================================
@@ -291,8 +339,11 @@ class RoundaboutDecisionNode(Node):
             "IN_ROUNDABOUT",
             "EXITING",
             "AFTER_EXIT_LEFT",
+            "AFTER_EXIT_RIGHT",
             "INTERSECTION_LEFT_FIX",
+            "INTERSECTION_RIGHT_FIX",
             "AFTER_INTERSECTION_RIGHT",
+            "FINAL_CENTER",
         ]:
             return
         
@@ -302,26 +353,36 @@ class RoundaboutDecisionNode(Node):
             return
 
         if best_right is not None:
-            self.pending_exit_index = self.right_arrow_exit_index
+            self.arrow_plan = "right_arrow"
+            self.first_exit_index = self.right_arrow_first_exit_index
+            self.second_exit_index = self.right_arrow_second_exit_index
+
+            self.pending_exit_index = self.first_exit_index
             self.pending_arrow_label = "right_arrow"
             self.roundabout_entry_enable_time = time.time() + self.roundabout_entry_delay_sec
             self.roundabout_entry_confirm_count = 0
 
             self.get_logger().warn(
                 f"RIGHT_ARROW detected | conf={best_right:.3f} | "
-                f"pending_exit_index={self.pending_exit_index} | "
+                f"first_exit={self.first_exit_index}, "
+                f"second_exit={self.second_exit_index} | "
                 "waiting for roundabout entry gap"
             )
 
         elif best_left is not None:
-            self.pending_exit_index = self.left_arrow_exit_index
+            self.arrow_plan = "left_arrow"
+            self.first_exit_index = self.left_arrow_first_exit_index
+            self.second_exit_index = self.left_arrow_second_exit_index
+
+            self.pending_exit_index = self.first_exit_index
             self.pending_arrow_label = "left_arrow"
             self.roundabout_entry_enable_time = time.time() + self.roundabout_entry_delay_sec
             self.roundabout_entry_confirm_count = 0
 
             self.get_logger().warn(
                 f"LEFT_ARROW detected | conf={best_left:.3f} | "
-                f"pending_exit_index={self.pending_exit_index} | "
+                f"first_exit={self.first_exit_index}, "
+                f"second_exit={self.second_exit_index} | "
                 "waiting for roundabout entry gap"
             )
 
@@ -333,6 +394,7 @@ class RoundaboutDecisionNode(Node):
 
         self.state = "ENTERING"
         self.desired_exit_index = int(desired_exit_index)
+        self.publish_drive_mode("roundabout")
 
         self.exit_count = 0
         self.gap_confirm_count = 0
@@ -520,11 +582,18 @@ class RoundaboutDecisionNode(Node):
     def timer_callback(self):
         now = time.time()
 
+        if self.state == "FINAL_CENTER":
+            self.publish_route(self.final_route)
+            return
+
         if self.state == "IDLE":
             self.publish_route(self.default_route)
 
             if self.check_roundabout_entry_gap_trigger():
                 self.roundabout_entry_count += 1
+
+                if self.roundabout_entry_count >= self.ttc_enable_entry_count:
+                    self.publish_ttc_enable(True)
 
                 self.start_roundabout(
                     desired_exit_index=self.pending_exit_index,
@@ -578,18 +647,16 @@ class RoundaboutDecisionNode(Node):
         # ============================================================
         if self.state == "IN_ROUNDABOUT":
             if self.desired_exit_index <= 1:
-                # 우회전: 1번째 출구이므로 right 고정
+                # 1번째 출구는 별도 exit gap count 없이 right 고정
                 self.publish_route(self.exit_route)
-                self.update_exit_count_by_gap()
 
-                if self.exit_count >= 1:
-                    self.state = "EXITING"
-                    self.exit_until = now + self.exit_hold_sec
-                    self.publish_route(self.exit_route)
-                    self.get_logger().warn(
-                        f"RIGHT EXIT confirmed. Hold {self.exit_route} "
-                        f"for {self.exit_hold_sec:.1f}s"
-                    )
+                self.state = "EXITING"
+                self.exit_until = now + self.exit_hold_sec
+
+                self.get_logger().warn(
+                    f"FIRST EXIT route | desired_exit=1 | "
+                    f"route={self.exit_route} | no exit gap counting"
+                )
 
                 return
 
@@ -618,22 +685,62 @@ class RoundaboutDecisionNode(Node):
             self.publish_route(self.exit_route)
 
             if now >= self.exit_until:
-                self.state = "AFTER_EXIT_LEFT"
-                self.after_exit_start_time = now
+                self.publish_drive_mode("normal")
 
+                # 2번째 회전교차로까지 끝났으면 최종 종료
+                if self.roundabout_entry_count >= 2:
+                    self.state = "FINAL_CENTER"
+
+                    # 마지막 좌/중앙/우 교차로에서는 center target을 따라감
+                    self.publish_route(self.final_route)
+
+                    self.get_logger().warn(
+                        f"Final roundabout completed. "
+                        f"State=FINAL_CENTER, route={self.final_route}"
+                    )
+                    return
+
+                # 1번째 회전교차로 탈출 후 공통 초기화
+                self.after_exit_start_time = now
                 self.intersection_trigger_confirm_count = 0
                 self.intersection_fix_done = False
 
-                self.publish_route(self.after_exit_route)
+                # right_arrow 시나리오:
+                # 1차 회전교차로 1번 출구 탈출 후 right 유지
+                if self.arrow_plan == "right_arrow":
+                    self.state = "AFTER_EXIT_RIGHT"
+                    self.roundabout_entry_confirm_count = 0
+                    self.roundabout_entry_enable_time = now + self.roundabout_entry_delay_sec
+
+                    # 두 번째 회전교차로는 right_arrow 계획상 3번째 출구
+                    if self.second_exit_index is not None:
+                        self.pending_exit_index = self.second_exit_index
+                        self.pending_arrow_label = self.arrow_plan
+
+                    self.publish_route(self.after_exit_right_route)
+
+                    self.get_logger().warn(
+                        f"Roundabout exit completed. "
+                        f"State=AFTER_EXIT_RIGHT, route={self.after_exit_right_route}. "
+                        f"Next roundabout entry gap trigger enabled after "
+                        f"{self.roundabout_entry_delay_sec:.1f}s"
+                    )
+
+                    return
+
+                # left_arrow 시나리오:
+                # 1차 회전교차로 3번 출구 탈출 후 left 유지 + 일반 교차로 보정
+                self.state = "AFTER_EXIT_LEFT"
+                self.publish_route(self.after_exit_left_route)
 
                 self.get_logger().warn(
                     f"Roundabout exit completed. "
-                    f"State=AFTER_EXIT_LEFT, route={self.after_exit_route}. "
+                    f"State=AFTER_EXIT_LEFT, route={self.after_exit_left_route}. "
                     f"Intersection gap trigger enabled after "
                     f"{self.intersection_trigger_delay_sec:.1f}s"
                 )
 
-            return
+                return
 
         # ============================================================
         # AFTER_EXIT_LEFT
@@ -641,13 +748,13 @@ class RoundaboutDecisionNode(Node):
         # 여기서 첫 번째 gap trigger는 일반 교차로 통과용 right 보정
         # ============================================================
         if self.state == "AFTER_EXIT_LEFT":
-            self.publish_route(self.after_exit_route)
+            self.publish_route(self.after_exit_left_route)
 
             elapsed = now - self.after_exit_start_time
 
             if now - self.last_log_time > 1.0:
                 self.get_logger().info(
-                    f"AFTER_EXIT_LEFT | route={self.after_exit_route} | "
+                    f"AFTER_EXIT_LEFT | route={self.after_exit_left_route} | "
                     f"elapsed={elapsed:.1f}s"
                 )
                 self.last_log_time = now
@@ -656,7 +763,7 @@ class RoundaboutDecisionNode(Node):
             if self.roundabout_entry_count >= 2:
                 if now - self.last_log_time > 1.0:
                     self.get_logger().info(
-                        f"FINAL AFTER_EXIT_LEFT | route={self.after_exit_route}"
+                        f"FINAL AFTER_EXIT_LEFT | route={self.after_exit_left_route}"
                     )
                     self.last_log_time = now
                 return
@@ -669,12 +776,49 @@ class RoundaboutDecisionNode(Node):
                 self.intersection_fix_until = now + self.intersection_fix_hold_sec
                 self.intersection_fix_done = True
 
-                # 일반 교차로에서는 left를 5초 유지
-                self.publish_route(self.intersection_fix_route)
+                # left_arrow 시나리오: 일반 교차로에서는 left를 유지
+                self.publish_route(self.intersection_fix_left_route)
 
                 self.get_logger().warn(
                     f"INTERSECTION_LEFT_FIX START | "
-                    f"route={self.intersection_fix_route} for "
+                    f"route={self.intersection_fix_left_route} for "
+                    f"{self.intersection_fix_hold_sec:.1f}s"
+                )
+
+            return
+        
+        # ============================================================
+        # AFTER_EXIT_RIGHT
+        # right_arrow 시나리오:
+        # 1차 회전교차로 1번 출구 탈출 후 right 유지
+        # 여기서 gap trigger는 일반 교차로 right 보정 시작점
+        # ============================================================
+        if self.state == "AFTER_EXIT_RIGHT":
+            self.publish_route(self.after_exit_right_route)
+
+            elapsed = now - self.after_exit_start_time
+
+            if now - self.last_log_time > 1.0:
+                self.get_logger().info(
+                    f"AFTER_EXIT_RIGHT | route={self.after_exit_right_route} | "
+                    f"elapsed={elapsed:.1f}s"
+                )
+                self.last_log_time = now
+
+            if elapsed < self.intersection_trigger_delay_sec:
+                return
+
+            if not self.intersection_fix_done and self.check_intersection_gap_trigger():
+                self.state = "INTERSECTION_RIGHT_FIX"
+                self.intersection_fix_until = now + self.intersection_fix_hold_sec
+                self.intersection_fix_done = True
+
+                # right_arrow 시나리오: 일반 교차로에서는 right를 유지
+                self.publish_route(self.intersection_fix_right_route)
+
+                self.get_logger().warn(
+                    f"INTERSECTION_RIGHT_FIX START | "
+                    f"route={self.intersection_fix_right_route} for "
                     f"{self.intersection_fix_hold_sec:.1f}s"
                 )
 
@@ -686,8 +830,8 @@ class RoundaboutDecisionNode(Node):
         # 일반 교차로에서 left를 5초 유지한 뒤 right로 전환
         # ============================================================
         if self.state == "INTERSECTION_LEFT_FIX":
-            # 일반 교차로 통과 중에는 left 유지
-            self.publish_route(self.intersection_fix_route)
+            # left_arrow 시나리오: 일반 교차로 통과 중에는 left 유지
+            self.publish_route(self.intersection_fix_left_route)
 
             if now >= self.intersection_fix_until:
                 self.state = "AFTER_INTERSECTION_RIGHT"
@@ -696,13 +840,10 @@ class RoundaboutDecisionNode(Node):
                 self.roundabout_entry_confirm_count = 0
                 self.roundabout_entry_enable_time = now + self.roundabout_entry_delay_sec
 
-                # left_arrow를 봤다면 두 번째 회전교차로도 3번째 출구로 나감
-                # pending_exit_index는 유지해도 되지만, 안전하게 다시 설정
-                if self.pending_exit_index is None:
-                    self.pending_exit_index = self.left_arrow_exit_index
-                    self.pending_arrow_label = "left_arrow"
+                if self.second_exit_index is not None:
+                    self.pending_exit_index = self.second_exit_index
+                    self.pending_arrow_label = self.arrow_plan
 
-                # 5초 후에는 right로 완전히 전환
                 self.publish_route(self.after_intersection_route)
 
                 self.get_logger().warn(
@@ -714,7 +855,39 @@ class RoundaboutDecisionNode(Node):
                 )
 
             return
+        
+        # ============================================================
+        # INTERSECTION_RIGHT_FIX
+        # right_arrow 시나리오:
+        # 일반 교차로에서 right를 일정 시간 유지한 뒤
+        # 기존 AFTER_INTERSECTION_RIGHT 상태로 이동
+        # ============================================================
+        if self.state == "INTERSECTION_RIGHT_FIX":
+            self.publish_route(self.intersection_fix_right_route)
 
+            if now >= self.intersection_fix_until:
+                self.state = "AFTER_INTERSECTION_RIGHT"
+                self.after_intersection_start_time = now
+
+                self.roundabout_entry_confirm_count = 0
+                self.roundabout_entry_enable_time = now + self.roundabout_entry_delay_sec
+
+                if self.second_exit_index is not None:
+                    self.pending_exit_index = self.second_exit_index
+                    self.pending_arrow_label = self.arrow_plan
+
+                # left/right 시나리오 모두 보정 후에는 right 유지
+                self.publish_route(self.after_intersection_route)
+
+                self.get_logger().warn(
+                    f"INTERSECTION_RIGHT_FIX done. "
+                    f"State=AFTER_INTERSECTION_RIGHT, "
+                    f"route={self.after_intersection_route}. "
+                    f"Next roundabout entry gap trigger enabled after "
+                    f"{self.roundabout_entry_delay_sec:.1f}s"
+                )
+
+            return
 
         # ============================================================
         # AFTER_INTERSECTION_RIGHT
@@ -740,11 +913,21 @@ class RoundaboutDecisionNode(Node):
             if self.check_roundabout_entry_gap_trigger():
                 self.roundabout_entry_count += 1
 
+                if self.roundabout_entry_count >= self.ttc_enable_entry_count:
+                    self.publish_ttc_enable(True)
+
+                if self.roundabout_entry_count >= 2:
+                    desired_exit = self.second_exit_index
+                else:
+                    desired_exit = self.first_exit_index
+
                 self.start_roundabout(
-                    desired_exit_index=self.pending_exit_index,
+                    desired_exit_index=desired_exit,
                     reason=(
                         f"roundabout_entry_gap_trigger "
-                        f"entry_count={self.roundabout_entry_count}"
+                        f"entry_count={self.roundabout_entry_count}, "
+                        f"plan={self.arrow_plan}, "
+                        f"desired_exit={desired_exit}"
                     ),
                 )
 
@@ -764,6 +947,22 @@ class RoundaboutDecisionNode(Node):
         if self.current_route != route:
             self.current_route = route
             self.get_logger().info(f"Route select: {route}")
+    
+    def publish_ttc_enable(self, enable):
+        msg = Bool()
+        msg.data = bool(enable)
+        self.ttc_enable_pub.publish(msg)
+
+        if enable:
+            self.get_logger().warn("TTC safety ENABLED")
+        else:
+            self.get_logger().info("TTC safety disabled")
+
+    def publish_drive_mode(self, mode):
+        msg = String()
+        msg.data = mode
+        self.drive_mode_pub.publish(msg)
+        self.get_logger().info(f"Drive mode publish: {mode}")
 
 
 def main(args=None):
@@ -776,6 +975,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.publish_ttc_enable(False)
         node.publish_route("right")
         node.destroy_node()
         rclpy.shutdown()

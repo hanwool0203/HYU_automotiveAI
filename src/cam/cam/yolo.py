@@ -60,7 +60,8 @@ class SingleYoloEngineNode(Node):
 
         if USE_LEFT_CAMERA:
             self.camera_name = "left"
-            self.image_topic = "/stereo/left_rect"
+            # self.image_topic = "/stereo/left_rect"
+            self.image_topic = "/left/image_raw"
             self.det_topic = "/yolo/left_detections"
             self.debug_topic = "/yolo/left_debug_image"
         else:
@@ -124,6 +125,8 @@ class SingleYoloEngineNode(Node):
             self.get_logger().error(f"cv_bridge error: {e}")
             return
 
+        image_h, image_w = frame.shape[:2]
+
         t0 = time.time()
 
         results = self.model.predict(
@@ -174,6 +177,8 @@ class SingleYoloEngineNode(Node):
             "camera": self.camera_name,
             "stamp_sec": msg.header.stamp.sec,
             "stamp_nanosec": msg.header.stamp.nanosec,
+            "image_width": image_w,
+            "image_height": image_h,
             "infer_ms": infer_ms,
             "detections": detections
         })
