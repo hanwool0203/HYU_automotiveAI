@@ -144,6 +144,11 @@ class CenterlineTRTNode(Node):
             "/centerline/target_right",
             10
         )
+        self.camera_overlay_pub = self.create_publisher(
+            Image,
+            "/centerline/camera_overlay",
+            10
+        )
 
         route_select_topic = self.get_parameter("route_select_topic").value
 
@@ -530,6 +535,46 @@ class CenterlineTRTNode(Node):
                 (orig_w, orig_h),
                 interpolation=cv2.INTER_NEAREST
             )
+
+            # =========================
+            # Camera overlay publish
+            # =========================
+            camera_overlay = image_bgr.copy()
+
+            # mask 영역을 빨간색으로 표시
+            red_layer = np.zeros_like(camera_overlay)
+            red_layer[:, :] = (0, 0, 255)
+
+            mask_bool = mask_orig > 0
+
+            # 원본 이미지와 빨간 mask를 반투명 합성
+            camera_overlay[mask_bool] = cv2.addWeighted(
+                camera_overlay[mask_bool],
+                0.4,
+                red_layer[mask_bool],
+                0.6,
+                0
+            )
+
+            # 원본 이미지 기준 target point도 표시하고 싶으면 기존 extract_target_point 사용
+            cam_tx, cam_ty, cam_valid = self.extract_target_point(mask_orig)
+
+            if cam_valid:
+                cv2.circle(camera_overlay, (int(cam_tx), int(cam_ty)), 8, (0, 255, 0), -1)
+                cv2.putText(
+                    camera_overlay,
+                    f"camera target=({cam_tx},{cam_ty})",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            camera_overlay_msg = self.bridge.cv2_to_imgmsg(camera_overlay, encoding="bgr8")
+            camera_overlay_msg.header = msg.header
+            self.camera_overlay_pub.publish(camera_overlay_msg)
 
             # =========================
             # 3. original mask → BEV mask

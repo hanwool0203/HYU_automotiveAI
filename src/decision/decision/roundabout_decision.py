@@ -30,9 +30,17 @@ class RoundaboutDecisionNode(Node):
         # ============================================================
         # YOLO labels
         # ============================================================
-        self.declare_parameter("left_arrow_label", "left_arrow")
-        self.declare_parameter("right_arrow_label", "right_arrow")
-        self.declare_parameter("arrow_conf_threshold", 0.45)
+        self.declare_parameter("left_arrow_label", "left_sign")
+        self.declare_parameter("right_arrow_label", "right_sign")
+        self.declare_parameter("arrow_conf_threshold", 0.70)
+        # arrow bbox가 너무 작으면 멀리 있는 불안정 검출로 보고 무시
+        self.declare_parameter("arrow_min_area_px", 400.0)
+
+        # 같은 방향 arrow가 몇 프레임 연속 나와야 확정할지
+        self.declare_parameter("arrow_confirm_frames", 1)
+
+        # left/right confidence 차이가 이 값보다 작으면 애매하다고 보고 확정하지 않음
+        self.declare_parameter("arrow_conf_margin", 0.30)
 
         # ============================================================
         # Route rule
@@ -70,7 +78,7 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("target_timeout_sec", 0.3)
 
         # gap 노이즈 제한
-        self.declare_parameter("gap_max_px", 350.0)
+        self.declare_parameter("gap_max_px", 310.0)
         self.declare_parameter("gap_jump_max_px", 300.0)
 
         self.declare_parameter("enable_intersection_fix_after_exit", True)
@@ -104,7 +112,15 @@ class RoundaboutDecisionNode(Node):
         self.arrow_conf_threshold = float(
             self.get_parameter("arrow_conf_threshold").value
         )
-
+        self.arrow_min_area_px = float(
+            self.get_parameter("arrow_min_area_px").value
+        )
+        self.arrow_confirm_frames = int(
+            self.get_parameter("arrow_confirm_frames").value
+        )
+        self.arrow_conf_margin = float(
+            self.get_parameter("arrow_conf_margin").value
+        )
         self.entry_route = self.get_parameter("entry_route").value.lower()
         self.roundabout_route = self.get_parameter("roundabout_route").value.lower()
         self.exit_route = self.get_parameter("exit_route").value.lower()
@@ -226,6 +242,9 @@ class RoundaboutDecisionNode(Node):
         self.second_exit_index = None
         self.arrow_plan = None
 
+        self.arrow_candidate = None
+        self.arrow_candidate_count = 0
+
         # ============================================================
         # ROS pubs/subs
         # ============================================================
@@ -304,6 +323,63 @@ class RoundaboutDecisionNode(Node):
         self.right_target = msg
         self.right_time = time.time()
 
+    def get_det_area(self, det):
+        """
+        YOLO detection JSON에서 bbox area 계산.
+        지원:
+        - x1, y1, x2, y2
+        - xmin, ymin, xmax, ymax
+        - bbox: [x1, y1, x2, y2]
+        - bbox: {"x1":..., "y1":..., "x2":..., "y2":...}
+        - width/height 또는 w/h
+        """
+        try:
+            if all(k in det for k in ["x1", "y1", "x2", "y2"]):
+                x1 = float(det["x1"])
+                y1 = float(det["y1"])
+                x2 = float(det["x2"])
+                y2 = float(det["y2"])
+                return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+            if all(k in det for k in ["xmin", "ymin", "xmax", "ymax"]):
+                x1 = float(det["xmin"])
+                y1 = float(det["ymin"])
+                x2 = float(det["xmax"])
+                y2 = float(det["ymax"])
+                return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+            if "bbox" in det:
+                bbox = det["bbox"]
+
+                if isinstance(bbox, list) and len(bbox) >= 4:
+                    x1, y1, x2, y2 = map(float, bbox[:4])
+                    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+                if isinstance(bbox, dict):
+                    if all(k in bbox for k in ["x1", "y1", "x2", "y2"]):
+                        x1 = float(bbox["x1"])
+                        y1 = float(bbox["y1"])
+                        x2 = float(bbox["x2"])
+                        y2 = float(bbox["y2"])
+                        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+                    if all(k in bbox for k in ["width", "height"]):
+                        return float(bbox["width"]) * float(bbox["height"])
+
+                    if all(k in bbox for k in ["w", "h"]):
+                        return float(bbox["w"]) * float(bbox["h"])
+
+            if all(k in det for k in ["width", "height"]):
+                return float(det["width"]) * float(det["height"])
+
+            if all(k in det for k in ["w", "h"]):
+                return float(det["w"]) * float(det["h"])
+
+        except Exception:
+            return 0.0
+
+        return 0.0
+
     def yolo_callback(self, msg):
         try:
             data = json.loads(msg.data)
@@ -313,6 +389,8 @@ class RoundaboutDecisionNode(Node):
 
         detections = data.get("detections", [])
         if not detections:
+            self.arrow_candidate = None
+            self.arrow_candidate_count = 0
             return
 
         best_left = None
@@ -321,17 +399,28 @@ class RoundaboutDecisionNode(Node):
         for det in detections:
             class_name = str(det.get("class_name", "")).lower()
             confidence = float(det.get("confidence", 0.0))
+            area = self.get_det_area(det)
 
             if confidence < self.arrow_conf_threshold:
                 continue
 
+            # 핵심: bbox 넓이가 일정 이상일 때만 arrow 인정
+            if area < self.arrow_min_area_px:
+                continue
+
             if class_name == self.left_arrow_label:
-                if best_left is None or confidence > best_left:
-                    best_left = confidence
+                if best_left is None or confidence > best_left["confidence"]:
+                    best_left = {
+                        "confidence": confidence,
+                        "area": area,
+                    }
 
             elif class_name == self.right_arrow_label:
-                if best_right is None or confidence > best_right:
-                    best_right = confidence
+                if best_right is None or confidence > best_right["confidence"]:
+                    best_right = {
+                        "confidence": confidence,
+                        "area": area,
+                    }
 
         # 회전교차로 처리 중에는 새 화살표 무시
         if self.state in [
@@ -352,7 +441,72 @@ class RoundaboutDecisionNode(Node):
         if self.pending_exit_index is not None:
             return
 
-        if best_right is not None:
+        # 유효 arrow가 없으면 후보 초기화
+        if best_left is None and best_right is None:
+            self.arrow_candidate = None
+            self.arrow_candidate_count = 0
+            return
+
+        # left/right 둘 다 잡힌 경우 confidence 차이가 작으면 애매하므로 확정 안 함
+        selected_label = None
+        selected_conf = None
+        selected_area = None
+
+        if best_left is not None and best_right is not None:
+            left_conf = best_left["confidence"]
+            right_conf = best_right["confidence"]
+
+            if abs(left_conf - right_conf) < self.arrow_conf_margin:
+                self.get_logger().warn(
+                    f"Arrow ambiguous | "
+                    f"left conf={left_conf:.3f}, area={best_left['area']:.0f} | "
+                    f"right conf={right_conf:.3f}, area={best_right['area']:.0f} | "
+                    f"margin={self.arrow_conf_margin:.3f}"
+                )
+                self.arrow_candidate = None
+                self.arrow_candidate_count = 0
+                return
+
+            if right_conf > left_conf:
+                selected_label = self.right_arrow_label
+                selected_conf = right_conf
+                selected_area = best_right["area"]
+            else:
+                selected_label = self.left_arrow_label
+                selected_conf = left_conf
+                selected_area = best_left["area"]
+
+        elif best_right is not None:
+            selected_label = self.right_arrow_label
+            selected_conf = best_right["confidence"]
+            selected_area = best_right["area"]
+
+        elif best_left is not None:
+            selected_label = self.left_arrow_label
+            selected_conf = best_left["confidence"]
+            selected_area = best_left["area"]
+
+        if selected_label is None:
+            return
+
+        # 같은 방향이 연속으로 나와야 확정
+        if self.arrow_candidate == selected_label:
+            self.arrow_candidate_count += 1
+        else:
+            self.arrow_candidate = selected_label
+            self.arrow_candidate_count = 1
+
+        self.get_logger().info(
+            f"Arrow candidate: {selected_label} | "
+            f"count={self.arrow_candidate_count}/{self.arrow_confirm_frames} | "
+            f"conf={selected_conf:.3f}, area={selected_area:.0f}"
+        )
+
+        if self.arrow_candidate_count < self.arrow_confirm_frames:
+            return
+
+        # 최종 확정
+        if selected_label == self.right_arrow_label:
             self.arrow_plan = "right_arrow"
             self.first_exit_index = self.right_arrow_first_exit_index
             self.second_exit_index = self.right_arrow_second_exit_index
@@ -363,13 +517,14 @@ class RoundaboutDecisionNode(Node):
             self.roundabout_entry_confirm_count = 0
 
             self.get_logger().warn(
-                f"RIGHT_ARROW detected | conf={best_right:.3f} | "
+                f"RIGHT_ARROW confirmed | "
+                f"conf={selected_conf:.3f}, area={selected_area:.0f} | "
                 f"first_exit={self.first_exit_index}, "
                 f"second_exit={self.second_exit_index} | "
                 "waiting for roundabout entry gap"
             )
 
-        elif best_left is not None:
+        elif selected_label == self.left_arrow_label:
             self.arrow_plan = "left_arrow"
             self.first_exit_index = self.left_arrow_first_exit_index
             self.second_exit_index = self.left_arrow_second_exit_index
@@ -380,7 +535,8 @@ class RoundaboutDecisionNode(Node):
             self.roundabout_entry_confirm_count = 0
 
             self.get_logger().warn(
-                f"LEFT_ARROW detected | conf={best_left:.3f} | "
+                f"LEFT_ARROW confirmed | "
+                f"conf={selected_conf:.3f}, area={selected_area:.0f} | "
                 f"first_exit={self.first_exit_index}, "
                 f"second_exit={self.second_exit_index} | "
                 "waiting for roundabout entry gap"

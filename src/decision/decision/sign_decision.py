@@ -40,16 +40,18 @@ class SignDecisionNode(Node):
         self.declare_parameter("rover_label", "other_rover")
 
         self.declare_parameter("stop_conf_threshold", 0.50)
-        self.declare_parameter("slow_conf_threshold", 0.80)
-        self.declare_parameter("traffic_conf_threshold", 0.30)
+        self.declare_parameter("stop_min_bbox_area", 1700.0)
+        self.declare_parameter("slow_conf_threshold", 0.50)
+        self.declare_parameter("slow_min_bbox_area", 1000.0)
+        self.declare_parameter("traffic_conf_threshold", 0.50)
         self.declare_parameter("rover_conf_threshold", 0.50)
 
         # traffic_light unknown stop은 N프레임 연속 가까울 때만 적용
-        self.declare_parameter("traffic_near_confirm_frames", 1)
-        self.declare_parameter("traffic_min_bbox_area", 4500.0)
+        self.declare_parameter("traffic_near_confirm_frames", 3)
+        self.declare_parameter("traffic_min_bbox_area", 500.0)
 
-        self.declare_parameter("rover_stop_min_bbox_area", 15000.0)
-        self.declare_parameter("rover_stop_duration_sec", 2.0)
+        self.declare_parameter("rover_stop_min_bbox_area", 12000.0)
+        self.declare_parameter("rover_stop_duration_sec", 1.5)
 
         # 최신 image가 너무 오래됐으면 무시
         self.declare_parameter("image_timeout_sec", 0.3)
@@ -67,7 +69,7 @@ class SignDecisionNode(Node):
         self.declare_parameter("one_shot_rover", False)
 
         # 신호등 색 판단 기준
-        self.declare_parameter("green_ratio_threshold", 0.020)
+        self.declare_parameter("green_ratio_threshold", 0.005)
 
         self.yolo_detections_topic = self.get_parameter("yolo_detections_topic").value
         self.image_topic = self.get_parameter("image_topic").value
@@ -87,8 +89,14 @@ class SignDecisionNode(Node):
         self.stop_conf_threshold = float(
             self.get_parameter("stop_conf_threshold").value
         )
+        self.stop_min_bbox_area = float(
+            self.get_parameter("stop_min_bbox_area").value
+        )
         self.slow_conf_threshold = float(
             self.get_parameter("slow_conf_threshold").value
+        )
+        self.slow_min_bbox_area = float(
+            self.get_parameter("slow_min_bbox_area").value
         )
         self.traffic_conf_threshold = float(
             self.get_parameter("traffic_conf_threshold").value
@@ -319,7 +327,7 @@ class SignDecisionNode(Node):
                     continue
                 if area < self.traffic_min_bbox_area:
                     self.get_logger().info(
-                        f"traffic_light ignored: area={area:.1f} < {self.traffic_min_bbox_area:.1f}"
+                        f"traffic_light ignored: conf={confidence:.3f} ,area={area:.1f} < {self.traffic_min_bbox_area:.1f}"
                     )
                     continue
 
@@ -373,19 +381,45 @@ class SignDecisionNode(Node):
 
                 continue
 
-            if class_name == self.stop_label and confidence >= self.stop_conf_threshold:
+            if class_name == self.stop_label:
+                if confidence < self.stop_conf_threshold:
+                    continue
+
+                if area < self.stop_min_bbox_area:
+                    self.get_logger().info(
+                        f"stop_sign ignored: "
+                        f"conf={confidence:.3f}, "
+                        f"area={area:.1f} < {self.stop_min_bbox_area:.1f}"
+                    )
+                    continue
+
                 if best_stop is None or confidence > best_stop["confidence"]:
                     best_stop = {
                         "confidence": confidence,
                         "area": area,
                     }
 
-            elif class_name == self.slow_label and confidence >= self.slow_conf_threshold:
+                continue
+
+            if class_name == self.slow_label:
+                if confidence < self.slow_conf_threshold:
+                    continue
+
+                if area < self.slow_min_bbox_area:
+                    self.get_logger().info(
+                        f"slow_sign ignored: "
+                        f"conf={confidence:.3f}, "
+                        f"area={area:.1f} < {self.slow_min_bbox_area:.1f}"
+                    )
+                    continue
+
                 if best_slow is None or confidence > best_slow["confidence"]:
                     best_slow = {
                         "confidence": confidence,
                         "area": area,
                     }
+
+                continue
 
         # ============================================================
         # 1. Traffic light 처리

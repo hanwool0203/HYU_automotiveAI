@@ -28,7 +28,7 @@ class LanePurePursuitController(Node):
         # 차량 기준점.
         # 처음에는 BEV 이미지 아래 중앙으로 둔다.
         # 차량을 트랙 중앙에 세웠을 때 target_x가 계속 570 근처면 car_center_x를 570으로 바꿔도 됨.
-        self.declare_parameter('car_center_x', 600.0)
+        self.declare_parameter('car_center_x', 500.0)
         self.declare_parameter('car_y', 1000.0)
 
         # =========================
@@ -84,8 +84,7 @@ class LanePurePursuitController(Node):
         # Decision / drive mode parameters
         # =========================
         self.declare_parameter('drive_mode_topic', '/drive_mode')
-        self.declare_parameter('safety_drive_mode_topic', '/safety/drive_mode')
-        self.declare_parameter('slow_speed_scale', 0.8)
+        self.declare_parameter('slow_speed_scale', 0.5)
 
         # USB 포트
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
@@ -99,7 +98,6 @@ class LanePurePursuitController(Node):
         self.latest_target = None
         self.latest_stamp_time = None
         self.drive_mode = 'normal'
-        self.safety_drive_mode = 'normal'
 
         target_topic = self.get_parameter('target_point_topic').value
         self.target_sub = self.create_subscription(
@@ -117,15 +115,6 @@ class LanePurePursuitController(Node):
             10
         )
         self.get_logger().info(f'Subscribing drive mode: {drive_mode_topic}')
-
-        safety_drive_mode_topic = self.get_parameter('safety_drive_mode_topic').value
-        self.safety_drive_mode_sub = self.create_subscription(
-            String,
-            safety_drive_mode_topic,
-            self.safety_drive_mode_callback,
-            10
-        )
-        self.get_logger().info(f'Subscribing safety drive mode: {safety_drive_mode_topic}')
 
         control_hz = float(self.get_parameter('control_hz').value)
         self.timer = self.create_timer(1.0 / control_hz, self.control_loop)
@@ -153,23 +142,6 @@ class LanePurePursuitController(Node):
 
         self.drive_mode = mode
     
-    def safety_drive_mode_callback(self, msg):
-        mode = msg.data.strip().lower()
-
-        if mode not in ['normal', 'slow', 'stop', 'roundabout']:
-            self.get_logger().warn(
-                f'Unknown safety drive mode: {mode}',
-                throttle_duration_sec=0.5
-            )
-            return
-
-        if mode != self.safety_drive_mode:
-            self.get_logger().warn(
-                f'Safety drive mode changed: {self.safety_drive_mode} -> {mode}'
-            )
-
-        self.safety_drive_mode = mode
-
     def control_loop(self):
         if self.latest_target is None:
             self.send_stop()
@@ -206,14 +178,6 @@ class LanePurePursuitController(Node):
             self.send_stop()
             return
 
-        if self.safety_drive_mode == 'stop':
-            self.get_logger().warn(
-                'Safety drive mode STOP. Stop vehicle.',
-                throttle_duration_sec=0.5
-            )
-            self.send_stop()
-            return
-
         left_cmd, right_cmd = self.compute_pure_pursuit_meter(tx_px, ty_px)
 
         self.send_motor_command(left_cmd, right_cmd)
@@ -234,7 +198,7 @@ class LanePurePursuitController(Node):
         if self.drive_mode == 'roundabout':
             base_speed_mps = float(self.get_parameter('roundabout_speed_mps').value)
 
-        elif self.safety_drive_mode == 'slow' or self.drive_mode == 'slow':
+        elif self.drive_mode == 'slow':
             slow_speed_scale = float(self.get_parameter('slow_speed_scale').value)
             base_speed_mps *= slow_speed_scale        
 

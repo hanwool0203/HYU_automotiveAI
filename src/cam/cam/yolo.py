@@ -26,9 +26,9 @@ USE_LEFT_CAMERA = True
 
 
 CLASS_NAMES = {
-    0: "left_arrow",
+    0: "left_sign",
     1: "other_rover",
-    2: "right_arrow",
+    2: "right_sign",
     3: "slow_sign",
     4: "stop_sign",
     5: "traffic_light",
@@ -41,10 +41,10 @@ class SingleYoloEngineNode(Node):
 
         self.declare_parameter(
             "model_path",
-            "/home/ircv7/workspace/ros2_ws/models/best_fp16.engine"
+            "/home/ircv7/workspace/ros2_ws/models/best6_fp16.engine"
         )
         self.declare_parameter("imgsz", 640)
-        self.declare_parameter("conf", 0.70)
+        self.declare_parameter("conf", 0.30)
         self.declare_parameter("iou", 0.45)
         self.declare_parameter("process_every_n", 1)
         self.declare_parameter("publish_debug_image", True)
