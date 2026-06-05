@@ -31,7 +31,7 @@ class SignDecisionNode(Node):
         # Sign parameters
         # ============================================================
         self.declare_parameter("stop_duration_sec", 2.0)
-        self.declare_parameter("slow_duration_sec", 5.0)
+        self.declare_parameter("slow_duration_sec", 8.0)
         self.declare_parameter("decision_cooldown_sec", 1.0)
 
         self.declare_parameter("stop_label", "stop_sign")
@@ -40,18 +40,19 @@ class SignDecisionNode(Node):
         self.declare_parameter("rover_label", "other_rover")
 
         self.declare_parameter("stop_conf_threshold", 0.50)
-        self.declare_parameter("stop_min_bbox_area", 1700.0)
+        self.declare_parameter("stop_min_bbox_area", 1400.0)
         self.declare_parameter("slow_conf_threshold", 0.50)
-        self.declare_parameter("slow_min_bbox_area", 1000.0)
+        self.declare_parameter("slow_min_bbox_area", 800.0)
         self.declare_parameter("traffic_conf_threshold", 0.50)
         self.declare_parameter("rover_conf_threshold", 0.50)
 
         # traffic_light unknown stop은 N프레임 연속 가까울 때만 적용
-        self.declare_parameter("traffic_near_confirm_frames", 3)
+        self.declare_parameter("traffic_near_confirm_frames", 5)
         self.declare_parameter("traffic_min_bbox_area", 500.0)
 
-        self.declare_parameter("rover_stop_min_bbox_area", 12000.0)
-        self.declare_parameter("rover_stop_duration_sec", 1.5)
+        self.declare_parameter("rover_stop_min_bbox_area", 15000.0)
+        self.declare_parameter("rover_max_bbox_area", 25000.0)
+        self.declare_parameter("rover_stop_duration_sec", 1.0)
 
         # 최신 image가 너무 오래됐으면 무시
         self.declare_parameter("image_timeout_sec", 0.3)
@@ -106,6 +107,9 @@ class SignDecisionNode(Node):
         )
         self.rover_stop_min_bbox_area = float(
             self.get_parameter("rover_stop_min_bbox_area").value
+        )
+        self.rover_max_bbox_area = float(
+            self.get_parameter("rover_max_bbox_area").value
         )
 
         self.rover_stop_duration_sec = float(
@@ -370,6 +374,14 @@ class SignDecisionNode(Node):
                         f"other_rover ignored: "
                         f"conf={confidence:.3f}, "
                         f"area={area:.1f} < {self.rover_stop_min_bbox_area:.1f}"
+                    )
+                    continue
+
+                if area > self.rover_max_bbox_area:
+                    self.get_logger().warn(
+                        f"other_rover ignored: too large bbox | "
+                        f"conf={confidence:.3f}, "
+                        f"area={area:.1f} > {self.rover_max_bbox_area:.1f}"
                     )
                     continue
 

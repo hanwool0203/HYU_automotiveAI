@@ -8,7 +8,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
@@ -23,8 +23,6 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("target_left_topic", "/centerline/target_left")
         self.declare_parameter("target_right_topic", "/centerline/target_right")
         self.declare_parameter("route_select_topic", "/route_select")
-        self.declare_parameter("ttc_enable_topic", "/ttc/enable")
-        self.declare_parameter("ttc_enable_entry_count", 2)
         self.declare_parameter("drive_mode_topic", "/drive_mode")
 
         # ============================================================
@@ -34,10 +32,11 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("right_arrow_label", "right_sign")
         self.declare_parameter("arrow_conf_threshold", 0.70)
         # arrow bbox가 너무 작으면 멀리 있는 불안정 검출로 보고 무시
-        self.declare_parameter("arrow_min_area_px", 400.0)
+        self.declare_parameter("arrow_min_area_px", 500.0)
+        self.declare_parameter("arrow_max_area_px", 2000.0)
 
         # 같은 방향 arrow가 몇 프레임 연속 나와야 확정할지
-        self.declare_parameter("arrow_confirm_frames", 1)
+        self.declare_parameter("arrow_confirm_frames", 3)
 
         # left/right confidence 차이가 이 값보다 작으면 애매하다고 보고 확정하지 않음
         self.declare_parameter("arrow_conf_margin", 0.30)
@@ -74,11 +73,11 @@ class RoundaboutDecisionNode(Node):
         self.declare_parameter("exit_gap_px", 180.0)
         self.declare_parameter("exit_gap_reset_px", 120.0)
         self.declare_parameter("exit_confirm_frames", 3)
-        self.declare_parameter("exit_min_interval_sec", 2.0)
+        self.declare_parameter("exit_min_interval_sec", 3.0)
         self.declare_parameter("target_timeout_sec", 0.3)
 
         # gap 노이즈 제한
-        self.declare_parameter("gap_max_px", 310.0)
+        self.declare_parameter("gap_max_px", 300.0)
         self.declare_parameter("gap_jump_max_px", 300.0)
 
         self.declare_parameter("enable_intersection_fix_after_exit", True)
@@ -102,11 +101,6 @@ class RoundaboutDecisionNode(Node):
         self.route_topic = self.get_parameter("route_select_topic").value
         self.drive_mode_topic = self.get_parameter("drive_mode_topic").value
 
-        self.ttc_enable_topic = self.get_parameter("ttc_enable_topic").value
-        self.ttc_enable_entry_count = int(
-            self.get_parameter("ttc_enable_entry_count").value
-        )
-
         self.left_arrow_label = self.get_parameter("left_arrow_label").value.lower()
         self.right_arrow_label = self.get_parameter("right_arrow_label").value.lower()
         self.arrow_conf_threshold = float(
@@ -114,6 +108,9 @@ class RoundaboutDecisionNode(Node):
         )
         self.arrow_min_area_px = float(
             self.get_parameter("arrow_min_area_px").value
+        )
+        self.arrow_max_area_px = float(
+            self.get_parameter("arrow_max_area_px").value
         )
         self.arrow_confirm_frames = int(
             self.get_parameter("arrow_confirm_frames").value
@@ -275,11 +272,6 @@ class RoundaboutDecisionNode(Node):
             10,
         )
 
-        self.ttc_enable_pub = self.create_publisher(
-            Bool,
-            self.ttc_enable_topic,
-            10,
-        )
         self.drive_mode_pub = self.create_publisher(
             String,
             self.drive_mode_topic,
@@ -289,7 +281,6 @@ class RoundaboutDecisionNode(Node):
         self.timer = self.create_timer(0.05, self.timer_callback)
 
         self.publish_route(self.default_route)
-        self.publish_ttc_enable(False)
 
         self.get_logger().info("Roundabout Decision Node Started")
         self.get_logger().info(f"Sub YOLO        : {self.yolo_topic}")
@@ -401,11 +392,27 @@ class RoundaboutDecisionNode(Node):
             confidence = float(det.get("confidence", 0.0))
             area = self.get_det_area(det)
 
+            # left/right arrow sign만 처리
+            if class_name not in [self.left_arrow_label, self.right_arrow_label]:
+                continue
+
+            # confidence 기준
             if confidence < self.arrow_conf_threshold:
                 continue
 
-            # 핵심: bbox 넓이가 일정 이상일 때만 arrow 인정
+            # 핵심: bbox 넓이가 정상 범위일 때만 arrow 인정
             if area < self.arrow_min_area_px:
+                self.get_logger().info(
+                    f"{class_name} ignored: area too small | "
+                    f"conf={confidence:.3f}, area={area:.1f} < {self.arrow_min_area_px:.1f}"
+                )
+                continue
+
+            if area > self.arrow_max_area_px:
+                self.get_logger().warn(
+                    f"{class_name} ignored: area too large | "
+                    f"conf={confidence:.3f}, area={area:.1f} > {self.arrow_max_area_px:.1f}"
+                )
                 continue
 
             if class_name == self.left_arrow_label:
@@ -420,7 +427,7 @@ class RoundaboutDecisionNode(Node):
                     best_right = {
                         "confidence": confidence,
                         "area": area,
-                    }
+        }
 
         # 회전교차로 처리 중에는 새 화살표 무시
         if self.state in [
@@ -748,9 +755,6 @@ class RoundaboutDecisionNode(Node):
             if self.check_roundabout_entry_gap_trigger():
                 self.roundabout_entry_count += 1
 
-                if self.roundabout_entry_count >= self.ttc_enable_entry_count:
-                    self.publish_ttc_enable(True)
-
                 self.start_roundabout(
                     desired_exit_index=self.pending_exit_index,
                     reason=(
@@ -1069,9 +1073,6 @@ class RoundaboutDecisionNode(Node):
             if self.check_roundabout_entry_gap_trigger():
                 self.roundabout_entry_count += 1
 
-                if self.roundabout_entry_count >= self.ttc_enable_entry_count:
-                    self.publish_ttc_enable(True)
-
                 if self.roundabout_entry_count >= 2:
                     desired_exit = self.second_exit_index
                 else:
@@ -1103,16 +1104,6 @@ class RoundaboutDecisionNode(Node):
         if self.current_route != route:
             self.current_route = route
             self.get_logger().info(f"Route select: {route}")
-    
-    def publish_ttc_enable(self, enable):
-        msg = Bool()
-        msg.data = bool(enable)
-        self.ttc_enable_pub.publish(msg)
-
-        if enable:
-            self.get_logger().warn("TTC safety ENABLED")
-        else:
-            self.get_logger().info("TTC safety disabled")
 
     def publish_drive_mode(self, mode):
         msg = String()
@@ -1131,7 +1122,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.publish_ttc_enable(False)
         node.publish_route("right")
         node.destroy_node()
         rclpy.shutdown()

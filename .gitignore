@@ -3,43 +3,22 @@ build/
 install/
 log/
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Dataset / bag / extracted images
+bag/
+extracted_images/
+stereo_calib_images/
 
-# VS Code
-.vscode/
-
-# ROS bag files
-*.bag
-*.db3
-*.mcap
-rosbag/
-rosbags/
-
-# Model / TensorRT / large weights
+# Model files
+models/
+*.pt
+*.pth
 *.onnx
-*.onnx.data
 *.engine
 *.trt
-*.pth
-*.pt
-*.ckpt
-*.weights
 
-# Dataset / images / videos
-dataset/
-datasets/
-images/
-frames/
-*.mp4
-*.avi
-*.mov
-*.jpg
-*.jpeg
-*.png
+# Python cache
+__pycache__/
+*.pyc
 
-# System
-.DS_Store
+# VSCode
+.vscode/

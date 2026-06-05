@@ -28,7 +28,7 @@ class LanePurePursuitController(Node):
         # 차량 기준점.
         # 처음에는 BEV 이미지 아래 중앙으로 둔다.
         # 차량을 트랙 중앙에 세웠을 때 target_x가 계속 570 근처면 car_center_x를 570으로 바꿔도 됨.
-        self.declare_parameter('car_center_x', 500.0)
+        self.declare_parameter('car_center_x', 600.0)
         self.declare_parameter('car_y', 1000.0)
 
         # =========================
@@ -67,7 +67,7 @@ class LanePurePursuitController(Node):
         # 곡률 보정 gain.
         # 정석 pure pursuit는 1.0.
         # 너무 흔들리면 0.5~0.8, 커브를 못 돌면 1.2~1.5
-        self.declare_parameter('curvature_gain', 6.5)
+        self.declare_parameter('curvature_gain', 7.5)
 
         # target point가 끊겼을 때 정지까지 걸리는 시간
         self.declare_parameter('target_timeout', 0.3)
@@ -84,7 +84,7 @@ class LanePurePursuitController(Node):
         # Decision / drive mode parameters
         # =========================
         self.declare_parameter('drive_mode_topic', '/drive_mode')
-        self.declare_parameter('slow_speed_scale', 0.5)
+        self.declare_parameter('slow_speed_scale', 0.75)
 
         # USB 포트
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
