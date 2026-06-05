@@ -1,0 +1,16 @@
+build/
+install/
+log/
+bag/
+extracted_images/
+
+__pycache__/
+*.pyc
+.vscode/
+
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
